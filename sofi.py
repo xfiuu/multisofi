@@ -157,7 +157,7 @@ async def drop_loop():
                 await ch.send("sd")
                 print(f"💬 {bot.user.name} gửi 'sd'")
             i += 1
-            await asyncio.sleep(20)
+            await asyncio.sleep(247)
         except: await asyncio.sleep(60)
 
 async def main():
