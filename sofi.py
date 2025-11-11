@@ -1,303 +1,427 @@
-import discord
-from discord.ext import commands
-import asyncio
-import os
-import threading
-import re
-from flask import Flask, request, render_template_string
+# PHIÊN BẢN TÍCH HỢP: Quản lý Panel + Cấu hình Nhặt Thẻ
+import os, requests, json, uuid, time
+from flask import Flask, request, render_template_string, jsonify
+from dotenv import load_dotenv
+from waitress import serve
 
-# --- CẤU HÌNH WEB SERVER & HTML ---
+load_dotenv()
+
+# --- CẤU HÌNH (Lấy từ code gốc) ---
+# Cần biết có bao nhiêu bot chính để tạo panel
+main_tokens = os.getenv("MAIN_TOKENS", "").split(",")
+BOT_NAMES = ["xsyx", "sofa", "dont", "ayaya", "owo", "astra", "singo", "dia pox", "clam", "rambo", "domixi", "dogi", "sicula", "mo turn", "jan taru", "kio sama"]
+
+# --- BIẾN TRẠNG THÁI ---
+servers = [] # Đây là danh sách các panel
+server_start_time = time.time()
+
+# --- HÀM TRỢ GIÚP (Lấy từ code gốc) ---
+def get_bot_name(bot_id_str):
+    try:
+        parts = bot_id_str.split('_')
+        b_type, b_index = parts[0], int(parts[1])
+        if b_type == 'main':
+            return BOT_NAMES[b_index - 1] if 0 < b_index <= len(BOT_NAMES) else f"MAIN_{b_index}"
+        return f"SUB_{b_index+1}"
+    except (IndexError, ValueError):
+        return bot_id_str.upper()
+
+# --- LƯU & TẢI CÀI ĐẶT (JSONBIN) ---
+def save_settings():
+    """Lưu danh sách 'servers' hiện tại lên JSONBin.io"""
+    api_key, bin_id = os.getenv("JSONBIN_API_KEY"), os.getenv("JSONBIN_BIN_ID")
+    settings_data = {'servers': servers, 'last_save_time': time.time()}
+    
+    if not (api_key and bin_id):
+        print("[Settings] ⚠️ Bỏ qua lưu: Thiếu JSONBIN_API_KEY hoặc JSONBIN_BIN_ID.", flush=True)
+        return
+
+    headers = {'Content-Type': 'application/json', 'X-Master-Key': api_key}
+    url = f"https://api.jsonbin.io/v3/b/{bin_id}"
+    
+    try:
+        req = requests.put(url, json=settings_data, headers=headers, timeout=10)
+        if req.status_code == 200:
+            print("[Settings] ✅ Đã lưu danh sách 'servers' lên JSONBin.io.", flush=True)
+        else:
+            print(f"[Settings] ❌ Lỗi JSONBin (HTTP {req.status_code}): {req.text}", flush=True)
+    except Exception as e:
+        print(f"[Settings] ❌ Lỗi khi kết nối JSONBin: {e}", flush=True)
+
+def load_settings():
+    """Tải danh sách 'servers' từ JSONBin.io khi khởi động"""
+    global servers
+    api_key, bin_id = os.getenv("JSONBIN_API_KEY"), os.getenv("JSONBIN_BIN_ID")
+    
+    if not (api_key and bin_id):
+        print("[Settings] ⚠️ Bỏ qua tải: Thiếu JSONBIN_API_KEY hoặc JSONBIN_BIN_ID.", flush=True)
+        return
+
+    headers = {'X-Master-Key': api_key}
+    url = f"https://api.jsonbin.io/v3/b/{bin_id}/latest"
+    
+    try:
+        req = requests.get(url, headers=headers, timeout=10)
+        if req.status_code == 200:
+            record = req.json().get("record", {})
+            servers.clear()
+            servers.extend(record.get('servers', []))
+            print(f"[Settings] ✅ Đã tải {len(servers)} server(s) từ JSONBin.io.", flush=True)
+        else:
+            print(f"[Settings] ⚠️ Không thể tải (mã: {req.status_code}). Bắt đầu với danh sách trống.", flush=True)
+    except Exception as e:
+        print(f"[Settings] ⚠️ Lỗi tải từ JSONBin: {e}. Bắt đầu với danh sách trống.", flush=True)
+
+# --- FLASK APP & GIAO DIỆN ---
 app = Flask(__name__)
 
-# Biến toàn cục lưu trữ cấu hình số tim
-DEFAULT_MIN_HEARTS = {"value": 1} # Mặc định nhặt từ 1 tim trở lên
-CHANNEL_CONFIGS = {} # Cấu hình riêng cho từng kênh: {"channel_id": {"name": "Tên Server", "hearts": 5}}
-
-
+# Giao diện HTML đã được TÍCH HỢP
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html>
+<html lang="vi">
 <head>
-    <title>Sofi Bot Config</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Integrated Panel Manager</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&family=Orbitron:wght@400;700&display=swap" rel="stylesheet">
     <style>
-        body { font-family: sans-serif; background-color: #2c2f33; color: #fff; text-align: center; padding: 20px 50px; }
-        .container { max-width: 800px; margin: 0 auto; text-align: left; }
-        h1 { color: #7289da; text-align: center; }
-        h2 { color: #7289da; border-bottom: 2px solid #7289da; padding-bottom: 5px; margin-top: 40px; }
-        input[type="number"], input[type="text"] { padding: 10px; font-size: 16px; width: 100%; box-sizing: border-box; border-radius: 5px; border: none; margin-bottom: 10px; background-color: #40444b; color: #fff; }
-        input[type="number"] { width: 120px; text-align: center; }
-        button { padding: 10px 20px; font-size: 16px; background-color: #7289da; color: white; border: none; border-radius: 5px; cursor: pointer; margin-top: 10px; }
-        button:hover { background-color: #5b6eae; }
-        button.delete { background-color: #f04747; }
-        button.delete:hover { background-color: #c03939; }
-        .status { text-align: center; margin: 20px 0; font-size: 18px; color: #43b581; font-weight: bold; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { border: 1px solid #40444b; padding: 12px; text-align: left; }
-        th { background-color: #36393f; }
-        form { background-color: #36393f; padding: 20px; border-radius: 8px; }
-        label { display: block; margin: 10px 0 5px; font-weight: bold; }
+        :root { --primary-bg: #0a0a0a; --secondary-bg: #1a1a1a; --panel-bg: #111111; --border-color: #333333; --blood-red: #8b0000; --dark-red: #550000; --bone-white: #f8f8ff; --necro-green: #228b22; --text-primary: #f0f0f0; --text-secondary: #cccccc; }
+        body { font-family: 'Courier Prime', monospace; background: var(--primary-bg); color: var(--text-primary); margin: 0; padding: 0;}
+        .container { max-width: 1600px; margin: 0 auto; padding: 20px; }
+        .header { text-align: center; margin-bottom: 30px; padding: 20px; border-bottom: 2px solid var(--blood-red); }
+        .title { font-family: 'Orbitron', cursive; font-size: 2.5rem; color: var(--blood-red); }
+        .main-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); gap: 20px; }
+        .panel { background: var(--panel-bg); border: 1px solid var(--border-color); border-radius: 10px; padding: 25px; position: relative;}
+        .panel h2 { font-family: 'Orbitron', cursive; font-size: 1.4rem; margin-bottom: 20px; border-bottom: 2px solid; padding-bottom: 10px; color: var(--bone-white); }
+        .panel h2 i { margin-right: 10px; }
+        .btn { background: var(--secondary-bg); border: 1px solid var(--border-color); color: var(--text-primary); padding: 10px 15px; border-radius: 4px; cursor: pointer; font-family: 'Orbitron', monospace; font-weight: 700; text-transform: uppercase; width: 100%; transition: all 0.3s ease; }
+        .btn:hover { background: var(--dark-red); border-color: var(--blood-red); }
+        .input-group { display: flex; align-items: stretch; gap: 10px; margin-bottom: 15px; }
+        .input-group label { background: #000; border: 1px solid var(--border-color); border-right: 0; padding: 10px 15px; border-radius: 4px 0 0 4px; display:flex; align-items:center; min-width: 120px;}
+        .input-group input { flex-grow: 1; background: #000; border: 1px solid var(--border-color); color: var(--text-primary); padding: 10px 15px; border-radius: 0 4px 4px 0; font-family: 'Courier Prime', monospace; }
+        .grab-section { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; padding: 15px; background: rgba(0,0,0,0.2); border-radius: 8px;}
+        .grab-section h3 { margin: 0; display: flex; align-items: center; gap: 10px; width: 80px; flex-shrink: 0; }
+        .grab-section .input-group { margin-bottom: 0; flex-grow: 1; margin-left: 20px;}
+        .msg-status { text-align: center; color: var(--necro-green); padding: 12px; border: 1px dashed var(--border-color); border-radius: 4px; margin-bottom: 20px; display: none; }
+        .msg-status.error { color: var(--blood-red); border-color: var(--blood-red); }
+        .status-panel { grid-column: 1 / -1; }
+        .status-row { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: rgba(0,0,0,0.4); border-radius: 8px; }
+        .timer-display { font-size: 1.2em; font-weight: 700; }
+        .add-server-btn { display: flex; align-items: center; justify-content: center; min-height: 200px; border: 2px dashed var(--border-color); cursor: pointer; transition: all 0.3s ease; }
+        .add-server-btn:hover { background: var(--secondary-bg); border-color: var(--blood-red); }
+        .add-server-btn i { font-size: 3rem; color: var(--text-secondary); }
+        .btn-delete-server { position: absolute; top: 15px; right: 15px; background: var(--dark-red); border: 1px solid var(--blood-red); color: var(--bone-white); width: 30px; height: 30px; border-radius: 50%; cursor: pointer; display:flex; align-items:center; justify-content:center; }
+        .server-sub-panel { border-top: 1px solid var(--border-color); margin-top: 20px; padding-top: 20px;}
+        .heart-input { flex-grow: 0 !important; width: 100px; text-align: center; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Bảng Điều Khiển Bot Sofi</h1>
-
-        {% if status_message %}
-        <div class="status">{{ status_message }}</div>
-        {% endif %}
-
-        <h2>Cấu Hình Mặc Định</h2>
-        <form method="POST" action="/">
-            <input type="hidden" name="action" value="set_default">
-            <label for="default_hearts">Số tim mặc định (cho các kênh không có panel):</label>
-            <input type="number" name="default_hearts" min="0" value="{{ default_value }}" required>
-            <br>
-            <button type="submit">Lưu Mặc Định</button>
-            <p style="font-size: 14px; color: #999;">Giá trị hiện tại: <b>{{ default_value }}</b> tim</p>
-        </form>
-        
-        <h2>Các Panel Đã Cấu Hình</h2>
-        {% if configs %}
-        <table>
-            <thead>
-                <tr>
-                    <th>Tên Server</th>
-                    <th>ID Kênh</th>
-                    <th>Nhặt từ (tim)</th>
-                    <th>Hành động</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for channel_id, config in configs.items() %}
-                <tr>
-                    <td>{{ config.name }}</td>
-                    <td>{{ channel_id }}</td>
-                    <td><b>{{ config.hearts }}</b></td>
-                    <td>
-                        <form method="POST" action="/" style="padding: 0; background: none;">
-                            <input type="hidden" name="action" value="delete_config">
-                            <input type="hidden" name="channel_id" value="{{ channel_id }}">
-                            <button type="submit" class="delete">Xóa</button>
-                        </form>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        {% else %}
-        <p>Chưa có panel nào được cấu hình. Sử dụng biểu mẫu bên dưới để thêm.</p>
-        {% endif %}
-
-        <h2>Thêm / Cập Nhật Panel</h2>
-        <form method="POST" action="/">
-            <input type="hidden" name="action" value="add_config">
+        <div class="header">
+            <h1 class="title">Integrated Panel Manager</h1>
+        </div>
+        <div id="msg-status-container" class="msg-status"> <span id="msg-status-text"></span></div>
+        <div class="main-grid">
+            <div class="panel status-panel">
+                 <div class="status-row">
+                    <span><i class="fas fa-server"></i> System Uptime</span>
+                    <div><span id="uptime-timer" class="timer-display">--:--:--</span></div>
+                </div>
+            </div>
             
-            <label for="server_name">Tên Server (Để bạn dễ nhớ):</label>
-            <input type="text" name="server_name" placeholder="Ví dụ: Server A, Kênh farm B..." required>
-
-            <label for="channel_id">ID Kênh (Channel ID):</label>
-            <input type="text" name="channel_id" placeholder="Nhập ID của kênh cần nhặt thẻ" required>
+            {% for server in servers %}
+            <div class="panel server-panel" data-server-id="{{ server.id }}">
+                <button class="btn-delete-server" title="Delete Server"><i class="fas fa-times"></i></button>
+                <h2><i class="fas fa-server"></i> {{ server.name }}</h2>
+                
+                <div class="server-sub-panel">
+                    <h3><i class="fas fa-cogs"></i> Channel Config</h3>
+                    <div class="input-group"><label>Main Channel ID</label><input type="text" class="channel-input" data-field="main_channel_id" value="{{ server.main_channel_id or '' }}"></div>
+                    <div class="input-group"><label>KTB Channel ID</label><input type="text" class="channel-input" data-field="ktb_channel_id" value="{{ server.ktb_channel_id or '' }}"></div>
+                </div>
+                
+                <div class="server-sub-panel">
+                    <h3><i class="fas fa-crosshairs"></i> Soul Harvest (Card Grab)</h3>
+                    {% for bot in main_bots_info %}
+                    <div class="grab-section">
+                        <h3>{{ bot.name }}</h3>
+                        <div class="input-group">
+                             <input type="number" class="harvest-threshold heart-input" data-node="{{ bot.id }}" value="{{ server['heart_threshold_' + bot.id|string] or 50 }}" min="0" placeholder="Min ♡">
+                            <input type="number" class="harvest-max-threshold heart-input" data-node="{{ bot.id }}" value="{{ server['max_heart_threshold_' + bot.id|string]|default(99999) }}" min="0" placeholder="Max ♡">
+                            <button type="button" class="btn harvest-toggle" data-node="{{ bot.id }}">
+                                {{ 'DISABLE' if server['auto_grab_enabled_' + bot.id|string] else 'ENABLE' }}
+                            </button>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                
+            </div>
+            {% endfor %}
             
-            <label for="min_hearts">Số tim tối thiểu để nhặt:</label>
-            <input type="number" name="min_hearts" min="0" value="1" required>
-            
-            <br>
-            <button type="submit">Lưu Panel</button>
-        </form>
-
+            <div class="panel add-server-btn" id="add-server-btn"> <i class="fas fa-plus"></i></div>
+        </div>
     </div>
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        const msgStatusContainer = document.getElementById('msg-status-container');
+        const msgStatusText = document.getElementById('msg-status-text');
+
+        function showStatusMessage(message, type = 'success', duration = 4000) {
+            if (!message) return;
+            msgStatusText.textContent = message;
+            msgStatusContainer.className = `msg-status ${type === 'error' ? 'error' : ''}`;
+            msgStatusContainer.style.display = 'block';
+            setTimeout(() => { msgStatusContainer.style.display = 'none'; }, duration);
+        }
+
+        async function postData(url = '', data = {}) {
+            try {
+                const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+                const result = await response.json();
+                showStatusMessage(result.message, result.status !== 'success' ? 'error' : 'success');
+                
+                // Tự động lưu cài đặt sau khi có thay đổi thành công
+                if (result.status === 'success' && url !== '/api/save_settings') {
+                    if (window.saveTimeout) clearTimeout(window.saveTimeout);
+                    // Chờ 1 chút để server xử lý rồi mới save
+                    window.saveTimeout = setTimeout(() => fetch('/api/save_settings', { method: 'POST' }), 500);
+                }
+                
+                if (result.status === 'success' && result.reload) { 
+                    setTimeout(() => window.location.reload(), 500); 
+                }
+                // Sau khi toggle, gọi fetchStatus để cập nhật lại text của nút
+                if (url === '/api/harvest_toggle') {
+                    setTimeout(fetchStatus, 100);
+                }
+                return result;
+            } catch (error) {
+                console.error('Error:', error);
+                showStatusMessage('Lỗi giao tiếp server.', 'error');
+            }
+        }
+
+        function formatTime(seconds) {
+            if (isNaN(seconds) || seconds < 0) return "--:--:--";
+            seconds = Math.floor(seconds);
+            const h = Math.floor(seconds / 3600).toString().padStart(2, '0');
+            const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0');
+            const s = (seconds % 60).toString().padStart(2, '0');
+            return `${h}:${m}:${s}`;
+        }
+        
+        function updateElement(element, { textContent }) {
+            if (!element) return;
+            if (textContent !== undefined && element.textContent !== textContent) element.textContent = textContent;
+        }
+
+        async function fetchStatus() {
+            try {
+                const response = await fetch('/status');
+                if (!response.ok) return;
+                const data = await response.json();
+                
+                // Cập nhật Uptime
+                const serverUptimeSeconds = (Date.now() / 1000) - data.server_start_time;
+                updateElement(document.getElementById('uptime-timer'), { textContent: formatTime(serverUptimeSeconds) });
+
+                // PHẦN TÍCH HỢP: Cập nhật text của các nút ENABLE/DISABLE
+                data.servers.forEach(serverData => {
+                    const serverPanel = document.querySelector(`.server-panel[data-server-id="${serverData.id}"]`);
+                    if (!serverPanel) return;
+                    serverPanel.querySelectorAll('.harvest-toggle').forEach(btn => {
+                        const node = btn.dataset.node;
+                        updateElement(btn, { textContent: serverData[`auto_grab_enabled_${node}`] ? 'DISABLE' : 'ENABLE' });
+                    });
+                });
+                
+            } catch (error) { console.error('Error fetching status:', error); }
+        }
+        setInterval(fetchStatus, 5000); // Cập nhật trạng thái mỗi 5 giây
+        fetchStatus();
+
+        // Lắng nghe sự kiện click
+        document.querySelector('.container').addEventListener('click', e => {
+            const button = e.target.closest('button');
+            if (!button) return;
+            
+            const serverPanel = button.closest('.server-panel');
+            const serverId = serverPanel ? serverPanel.dataset.serverId : null;
+
+            // Xử lý nút XÓA server
+            if (button.classList.contains('btn-delete-server')) {
+                if (serverId && confirm('Bạn có chắc muốn xóa panel này?')) {
+                    postData('/api/delete_server', { server_id: serverId });
+                }
+                return;
+            }
+            
+            // PHẦN TÍCH HỢP: Xử lý nút Harvest Toggle
+            if (button.classList.contains('harvest-toggle')) {
+                if (serverId) {
+                    const node = button.dataset.node;
+                    postData('/api/harvest_toggle', { 
+                        server_id: serverId, 
+                        node: node, 
+                        // Lấy giá trị min/max heart khi nhấn nút
+                        threshold: serverPanel.querySelector(`.harvest-threshold[data-node="${node}"]`).value, 
+                        max_threshold: serverPanel.querySelector(`.harvest-max-threshold[data-node="${node}"]`).value 
+                    });
+                }
+                return;
+            }
+        });
+        
+        // PHẦN TÍCH HỢP: Lắng nghe sự kiện THAY ĐỔI (lưu channel ID)
+        document.querySelector('.main-grid').addEventListener('change', e => {
+            const target = e.target;
+            const serverPanel = target.closest('.server-panel');
+            // Nếu là ô input channel-input
+            if (serverPanel && target.classList.contains('channel-input')) {
+                const payload = { server_id: serverPanel.dataset.serverId };
+                payload[target.dataset.field] = target.value; // data-field="main_channel_id"
+                postData('/api/update_server_field', payload);
+            }
+        });
+
+        // Xử lý nút THÊM server
+        document.getElementById('add-server-btn').addEventListener('click', () => {
+            const name = prompt("Nhập tên cho panel server mới:", "Server Mới");
+            if (name && name.trim()) { 
+                postData('/api/add_server', { name: name.trim() }); 
+            }
+        });
+    });
+</script>
 </body>
 </html>
 """
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/")
 def index():
-    status_message = None
-    if request.method == "POST":
-        action = request.form.get("action")
+    """Hiển thị trang chủ với các panel đã lưu"""
+    # PHẦN TÍCH HỢP: Cần tạo main_bots_info để template có thể lặp qua
+    main_bots_count = len([t for t in main_tokens if t.strip()])
+    main_bots_info = []
+    for i in range(main_bots_count):
+        bot_num = i + 1
+        main_bots_info.append({"id": bot_num, "name": get_bot_name(f'main_{bot_num}')})
         
-        try:
-            if action == "set_default":
-                new_val = int(request.form.get("default_hearts"))
-                DEFAULT_MIN_HEARTS["value"] = new_val
-                status_message = f"✅ Đã lưu! Mặc định nhặt từ {new_val} tim."
-                print(f"🌐 [WEB] Đã cập nhật DEFAULT_HEARTS lên: {new_val}")
-            
-            elif action == "add_config":
-                server_name = request.form.get("server_name", "Không Tên")
-                channel_id = request.form.get("channel_id")
-                min_hearts = int(request.form.get("min_hearts"))
-                
-                if not channel_id or not channel_id.isdigit():
-                     status_message = "❌ Lỗi: ID Kênh phải là số và không được để trống."
-                else:
-                    CHANNEL_CONFIGS[channel_id] = {"name": server_name, "hearts": min_hearts}
-                    status_message = f"✅ Đã lưu Panel cho '{server_name}' (ID: {channel_id}) với {min_hearts} tim."
-                    print(f"🌐 [WEB] Đã thêm/cập nhật Panel: {channel_id} - {server_name} - {min_hearts} tim")
-            
-            elif action == "delete_config":
-                channel_id_to_delete = request.form.get("channel_id")
-                if channel_id_to_delete in CHANNEL_CONFIGS:
-                    deleted_name = CHANNEL_CONFIGS.pop(channel_id_to_delete)["name"]
-                    status_message = f"✅ Đã xóa Panel '{deleted_name}' (ID: {channel_id_to_delete})."
-                    print(f"🌐 [WEB] Đã xóa Panel: {channel_id_to_delete}")
-                
-        except (ValueError, TypeError):
-            status_message = "❌ Lỗi: Vui lòng nhập số hợp lệ cho ID Kênh và Số Tim."
-        except Exception as e:
-            status_message = f"❌ Lỗi máy chủ: {e}"
-
-    return render_template_string(
-        HTML_TEMPLATE, 
-        default_value=DEFAULT_MIN_HEARTS["value"], 
-        configs=CHANNEL_CONFIGS, 
-        status_message=status_message
+    return render_template_string(HTML_TEMPLATE, 
+        servers=sorted(servers, key=lambda s: s.get('name', '')),
+        main_bots_info=main_bots_info # Truyền thông tin bot cho template
     )
 
-def run_flask():
-    # Chạy Flask trên port 10000 (thường dùng cho Render) hoặc port được chỉ định
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
-
-def keep_alive():
-    t = threading.Thread(target=run_flask)
-    t.daemon = True
-    t.start()
-
-# --- CẤU HÌNH BOT ---
-accounts = [
-    {"token": os.getenv("TOKEN1"), "channel_id": os.getenv("CHANNEL_ID")}, # ACC CHÍNH
-    {"token": os.getenv("TOKEN2"), "channel_id": os.getenv("CHANNEL_ID")}, # Acc phụ
-    {"token": os.getenv("TOKEN3"), "channel_id": os.getenv("CHANNEL_ID")}, # Acc phụ
-]
-
-SOFI_ID = 853629533855809596
-MAIN_ACC_GRAB_DELAY = 1.5 # Giây
-running_bots = []
-
-# --- BOT LOGIC ---
-def get_heart_count(button):
-    text = button.label
-    if not text: return 0
-    numbers = re.findall(r'\d+', str(text))
-    return int("".join(numbers)) if numbers else 0
-
-async def click_and_message(message, delay, bot, account_info, is_main_acc):
-    if not is_main_acc: return
-    await asyncio.sleep(delay)
-    try:
-        # print(f"[{account_info['channel_id']}] → 🔎 {bot.user.name} đang soi tim...")
-        fetched_message = None
-        found_buttons = []
-        for _ in range(5):
-            try:
-                fetched_message = await message.channel.fetch_message(message.id)
-                found_buttons = [c for row in fetched_message.components for c in row.children if isinstance(c, discord.Button)]
-                if found_buttons: break
-            except: pass
-            await asyncio.sleep(1)
-
-        if found_buttons:
-            # === LOGIC NÂNG CẤP: LẤY CẤU HÌNH THEO KÊNH ===
-            current_channel_id = str(message.channel.id)
-            config = CHANNEL_CONFIGS.get(current_channel_id)
-            
-            if config:
-                min_hearts_needed = config["hearts"]
-                config_name = f"'{config['name']}'"
-            else:
-                min_hearts_needed = DEFAULT_MIN_HEARTS["value"]
-                config_name = "Mặc Định"
-            # ============================================
-
-            best_button = None
-            max_hearts = -1
-
-            print(f"--- 📊 Phân tích thẻ (Kênh: {current_channel_id}, Cấu hình: {config_name}, Yêu cầu: >={min_hearts_needed} tim) ---")
-            for idx, button in enumerate(found_buttons):
-                hearts = get_heart_count(button)
-                print(f"   ➤ Nút {idx+1}: {hearts} tim")
-                if hearts >= min_hearts_needed and hearts > max_hearts:
-                    max_hearts = hearts
-                    best_button = button
-                elif hearts >= min_hearts_needed and hearts == max_hearts and best_button is None:
-                     best_button = button
-            
-            if best_button:
-                await asyncio.sleep(0.5)
-                await best_button.click()
-                print(f"[{current_channel_id}] → 🏆 ĐÃ CLICK nút {max_hearts} tim!")
-            else:
-                print(f"[{current_channel_id}] → ⚠️ Không có thẻ nào đủ {min_hearts_needed} tim để nhặt (theo cấu hình {config_name}).")
-            print("------------------------------------------------")
-
-    except Exception as e:
-        print(f"⚠️ Lỗi click: {e}")
-
-async def run_account(account, idx, startup_delay):
-    is_main = (idx == 0)
-    if startup_delay > 0: await asyncio.sleep(startup_delay)
-    bot = commands.Bot(command_prefix="!", self_bot=True)
-
-    @bot.event
-    async def on_ready():
-        print(f"[{'ACC CHÍNH 👑' if is_main else 'Acc phụ 🤖'}] Đã đăng nhập: {bot.user}")
-        running_bots.append(bot)
-
-    @bot.event
-    async def on_message(message):
-        # *** LƯU Ý: Phần `account["channel_id"]` trong `accounts` giờ chỉ dùng để auto-drop "sd"
-        # Logic nhặt thẻ (click_and_message) sẽ tự động áp dụng cho BẤT KỲ KÊNH NÀO
-        # mà bot chính (is_main) nhìn thấy tin nhắn của Sofi.
+@app.route("/api/add_server", methods=['POST'])
+def api_add_server():
+    """API để thêm một panel server mới"""
+    name = request.json.get('name')
+    if not name: 
+        return jsonify({'status': 'error', 'message': 'Tên server là bắt buộc.'}), 400
+    
+    new_server = {
+        "id": f"server_{uuid.uuid4().hex}", 
+        "name": name
+    }
+    
+    # PHẦN TÍCH HỢP: Thêm các key mặc định cho nhặt thẻ vào server mới
+    main_bots_count = len([t for t in main_tokens if t.strip()])
+    for i in range(main_bots_count):
+        bot_num = i + 1
+        new_server[f'auto_grab_enabled_{bot_num}'] = False
+        new_server[f'heart_threshold_{bot_num}'] = 50
+        new_server[f'max_heart_threshold_{bot_num}'] = 99999
         
-        if message.author.id == SOFI_ID: # Bot sẽ phản ứng ở mọi kênh nó thấy
-            if is_main and ("dropping" in message.content.lower() or "thả" in message.content.lower()):
-                print(f"🎯 {bot.user.name} phát hiện drop trong kênh {message.channel.id}! Đang soi...")
-                # Logic mới sẽ tự kiểm tra xem kênh này có panel không
-                asyncio.create_task(click_and_message(message, MAIN_ACC_GRAB_DELAY, bot, account, True))
+    servers.append(new_server)
+    save_settings() # Lưu ngay lập tức
+    
+    return jsonify({'status': 'success', 'message': f'✅ Panel "{name}" đã được thêm.', 'reload': True})
 
-    try: await bot.start(account["token"])
-    except Exception as e: print(f"❌ Lỗi login {account['token'][:5]}...: {e}")
+@app.route("/api/delete_server", methods=['POST'])
+def api_delete_server():
+    """API để xóa một panel server"""
+    server_id = request.json.get('server_id')
+    servers_count_before = len(servers)
+    servers[:] = [s for s in servers if s.get('id') != server_id]
+    servers_count_after = len(servers)
 
-async def drop_loop():
-    while len(running_bots) < len([a for a in accounts if a.get("token")]): await asyncio.sleep(5)
-    print("\n🚀 AUTO DROP BẮT ĐẦU!\n")
-    i = 0
-    while True:
-        try:
-            # Vẫn loop qua các channel_id trong cấu hình `accounts` để gửi 'sd'
-            bot = running_bots[i % len(running_bots)]
-            acc = accounts[i % len(accounts)]
-            ch_id = acc.get("channel_id")
+    if servers_count_before == servers_count_after:
+        return jsonify({'status': 'error', 'message': 'Không tìm thấy panel để xóa.'})
+
+    save_settings()
+    return jsonify({'status': 'success', 'message': f'🗑️ Panel đã được xóa.', 'reload': True})
+
+# --- CÁC API MỚI ĐƯỢC TÍCH HỢP ---
+
+def find_server(server_id): 
+    """Hàm trợ giúp tìm server theo ID"""
+    return next((s for s in servers if s.get('id') == server_id), None)
+
+@app.route("/api/update_server_field", methods=['POST'])
+def api_update_server_field():
+    """API để cập nhật các trường input (như channel ID)"""
+    data = request.json
+    server = find_server(data.get('server_id'))
+    if not server: 
+        return jsonify({'status': 'error', 'message': 'Không tìm thấy server.'}), 404
+    
+    key_updated = ""
+    for key, value in data.items():
+        if key != 'server_id':
+            server[key] = value
+            key_updated = key
             
-            if not ch_id:
-                print(f"⚠️ Bỏ qua drop cho {bot.user.name} vì không có CHANNEL_ID trong cấu hình.")
-                i += 1
-                await asyncio.sleep(60) # Chờ 1 phút rồi thử acc tiếp
-                continue
-                
-            ch = bot.get_channel(int(ch_id))
-            if ch:
-                await ch.send("sd")
-                print(f"💬 {bot.user.name} gửi 'sd' đến kênh {ch_id}")
-            else:
-                print(f"⚠️ {bot.user.name} không tìm thấy kênh {ch_id} để gửi 'sd'")
-                
-            i += 1
-            await asyncio.sleep(247) # Thời gian nghỉ giữa các lần drop
-        except Exception as e:
-            print(f"Lỗi trong drop_loop: {e}")
-            await asyncio.sleep(60)
+    return jsonify({'status': 'success', 'message': f'🔧 Đã cập nhật {key_updated} cho {server.get("name")}.'})
 
-async def main():
-    keep_alive() # Khởi động web server
-    tasks = []
-    active_accs = [acc for acc in accounts if acc.get("token")]
-    for i, acc in enumerate(active_accs):
-        tasks.append(run_account(acc, i, i * 5))
-    if tasks:
-        tasks.append(drop_loop())
-        await asyncio.gather(*tasks)
+@app.route("/api/harvest_toggle", methods=['POST'])
+def api_harvest_toggle():
+    """API để bật/tắt nhặt thẻ và lưu threshold"""
+    data = request.json
+    server, node_str = find_server(data.get('server_id')), data.get('node')
+    if not server or not node_str: 
+        return jsonify({'status': 'error', 'message': 'Yêu cầu không hợp lệ.'}), 400
+    
+    node = str(node_str) # node là "1", "2", ...
+    grab_key = f'auto_grab_enabled_{node}'
+    threshold_key = f'heart_threshold_{node}'
+    max_threshold_key = f'max_heart_threshold_{node}'
+    
+    # Bật/Tắt
+    server[grab_key] = not server.get(grab_key, False)
+    
+    # Cập nhật threshold
+    try:
+        server[threshold_key] = int(data.get('threshold', 50))
+        server[max_threshold_key] = int(data.get('max_threshold', 99999))
+    except (ValueError, TypeError):
+        server[threshold_key] = 50
+        server[max_threshold_key] = 99999
+        
+    status_msg = 'ENABLED' if server[grab_key] else 'DISABLED'
+    bot_name = get_bot_name(f'main_{node}')
+    return jsonify({'status': 'success', 'message': f"🎯 Nhặt thẻ cho {bot_name} đã {status_msg}."})
 
+@app.route("/api/save_settings", methods=['POST'])
+def api_save_settings(): 
+    """API để JS gọi lưu cài đặt"""
+    save_settings()
+    return jsonify({'status': 'success', 'message': '💾 Đã lưu cài đặt.'})
+
+@app.route("/status")
+def status_endpoint():
+    """API cung cấp Uptime và danh sách server cho JS"""
+    return jsonify({
+        'server_start_time': server_start_time,
+        'servers': servers # PHẦN TÍCH HỢP: Trả về servers để JS cập nhật UI
+    })
+
+# --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("🚀 Integrated Panel Manager - Đang khởi động...", flush=True)
+    load_settings() # Tải các panel đã lưu từ JSONBin
+
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 Máy chủ web đang chạy tại http://0.0.0.0:{port}", flush=True)
+    serve(app, host="0.0.0.0", port=port)
