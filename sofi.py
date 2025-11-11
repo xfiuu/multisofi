@@ -1,21 +1,53 @@
-# PHIÊN BẢN TÍCH HỢP: Quản lý Panel + Cấu hình Nhặt Thẻ
-import os, requests, json, uuid, time
+# PHIÊN BẢN TÍCH HỢP: Panel + Logic Bot Nhặt Thẻ SOFI (Button-based)
+import os, requests, json, uuid, time, re
+import discord
+from discord.ext import commands
+import asyncio
+import threading
 from flask import Flask, request, render_template_string, jsonify
 from dotenv import load_dotenv
 from waitress import serve
 
 load_dotenv()
 
-# --- CẤU HÌNH (Lấy từ code gốc) ---
-# Cần biết có bao nhiêu bot chính để tạo panel
+# --- CẤU HÌNH BOT ---
 main_tokens = os.getenv("MAIN_TOKENS", "").split(",")
 BOT_NAMES = ["xsyx", "sofa", "dont", "ayaya", "owo", "astra", "singo", "dia pox", "clam", "rambo", "domixi", "dogi", "sicula", "mo turn", "jan taru", "kio sama"]
+SOFI_ID = 853629533855809596 # ID của bot Sofi
 
-# --- BIẾN TRẠNG THÁI ---
+# --- BIẾN TRẠNG THÁI & QUẢN LÝ BOT ---
 servers = [] # Đây là danh sách các panel
 server_start_time = time.time()
 
-# --- HÀM TRỢ GIÚP (Lấy từ code gốc) ---
+class ThreadSafeBotManager:
+    """Quản lý các instance bot đang chạy trong các luồng riêng biệt"""
+    def __init__(self):
+        self._bots = {}
+        self._lock = threading.RLock()
+
+    def add_bot(self, bot_id, bot_data):
+        with self._lock:
+            self._bots[bot_id] = bot_data
+            print(f"[Bot Manager] ✅ Đã thêm bot: {bot_id}", flush=True)
+
+    def remove_bot(self, bot_id):
+        with self._lock:
+            bot_data = self._bots.pop(bot_id, None)
+            if bot_data and bot_data.get('instance'):
+                bot = bot_data['instance']
+                loop = bot_data['loop']
+                if loop.is_running():
+                    asyncio.run_coroutine_threadsafe(bot.close(), loop)
+                print(f"[Bot Manager] 🗑️ Đã xóa và yêu cầu dọn dẹp bot: {bot_id}", flush=True)
+            return bot_data
+
+    def get_bot_data(self, bot_id):
+        with self._lock:
+            return self._bots.get(bot_id)
+
+bot_manager = ThreadSafeBotManager()
+
+# --- HÀM TRỢ GIÚP ---
 def get_bot_name(bot_id_str):
     try:
         parts = bot_id_str.split('_')
@@ -26,40 +58,32 @@ def get_bot_name(bot_id_str):
     except (IndexError, ValueError):
         return bot_id_str.upper()
 
+def get_heart_count(button):
+    """Trích xuất số tim từ label của button (lấy từ multisofi.py)"""
+    text = button.label
+    if not text: return 0
+    numbers = re.findall(r'\d+', str(text))
+    return int("".join(numbers)) if numbers else 0
+
 # --- LƯU & TẢI CÀI ĐẶT (JSONBIN) ---
 def save_settings():
-    """Lưu danh sách 'servers' hiện tại lên JSONBin.io"""
     api_key, bin_id = os.getenv("JSONBIN_API_KEY"), os.getenv("JSONBIN_BIN_ID")
     settings_data = {'servers': servers, 'last_save_time': time.time()}
-    
-    if not (api_key and bin_id):
-        print("[Settings] ⚠️ Bỏ qua lưu: Thiếu JSONBIN_API_KEY hoặc JSONBIN_BIN_ID.", flush=True)
-        return
-
+    if not (api_key and bin_id): return
     headers = {'Content-Type': 'application/json', 'X-Master-Key': api_key}
     url = f"https://api.jsonbin.io/v3/b/{bin_id}"
-    
     try:
-        req = requests.put(url, json=settings_data, headers=headers, timeout=10)
-        if req.status_code == 200:
-            print("[Settings] ✅ Đã lưu danh sách 'servers' lên JSONBin.io.", flush=True)
-        else:
-            print(f"[Settings] ❌ Lỗi JSONBin (HTTP {req.status_code}): {req.text}", flush=True)
+        requests.put(url, json=settings_data, headers=headers, timeout=10)
+        print("[Settings] ✅ Đã lưu 'servers' lên JSONBin.io.", flush=True)
     except Exception as e:
-        print(f"[Settings] ❌ Lỗi khi kết nối JSONBin: {e}", flush=True)
+        print(f"[Settings] ❌ Lỗi khi lưu JSONBin: {e}", flush=True)
 
 def load_settings():
-    """Tải danh sách 'servers' từ JSONBin.io khi khởi động"""
     global servers
     api_key, bin_id = os.getenv("JSONBIN_API_KEY"), os.getenv("JSONBIN_BIN_ID")
-    
-    if not (api_key and bin_id):
-        print("[Settings] ⚠️ Bỏ qua tải: Thiếu JSONBIN_API_KEY hoặc JSONBIN_BIN_ID.", flush=True)
-        return
-
+    if not (api_key and bin_id): return
     headers = {'X-Master-Key': api_key}
     url = f"https://api.jsonbin.io/v3/b/{bin_id}/latest"
-    
     try:
         req = requests.get(url, headers=headers, timeout=10)
         if req.status_code == 200:
@@ -67,22 +91,129 @@ def load_settings():
             servers.clear()
             servers.extend(record.get('servers', []))
             print(f"[Settings] ✅ Đã tải {len(servers)} server(s) từ JSONBin.io.", flush=True)
-        else:
-            print(f"[Settings] ⚠️ Không thể tải (mã: {req.status_code}). Bắt đầu với danh sách trống.", flush=True)
     except Exception as e:
         print(f"[Settings] ⚠️ Lỗi tải từ JSONBin: {e}. Bắt đầu với danh sách trống.", flush=True)
+
+# --- LOGIC NHẶT THẺ (TÍCH HỢP TỪ multisofi.py) ---
+async def handle_sofi_grab(bot, message, bot_num):
+    channel_id = str(message.channel.id)
+    
+    # 1. Tìm panel server tương ứng với kênh
+    target_server = next((s for s in servers if s.get('main_channel_id') == channel_id), None)
+    if not target_server:
+        return # Tin nhắn này không ở trong kênh main channel nào được cấu hình
+
+    # 2. Kiểm tra xem bot này có được bật nhặt ở server này không
+    bot_num_str = str(bot_num)
+    grab_key = f'auto_grab_enabled_{bot_num_str}'
+    if not target_server.get(grab_key, False):
+        # print(f"[Sofi Grab] Bot {bot_num} đã tắt nhặt tại server {target_server.get('name')}")
+        return
+
+    # 3. Lấy cấu hình min/max hearts từ panel
+    min_hearts_needed = target_server.get(f'heart_threshold_{bot_num_str}', 50)
+    max_hearts_allowed = target_server.get(f'max_heart_threshold_{bot_num_str}', 99999)
+
+    print(f"--- 📊 [Sofi Grab] Bot {bot_num} phân tích thẻ (Yêu cầu: {min_hearts_needed}♡ - {max_hearts_allowed}♡) ---")
+
+    try:
+        fetched_message = None
+        found_buttons = []
+        # Cố gắng fetch message vài lần để đợi button xuất hiện
+        for _ in range(5):
+            try:
+                fetched_message = await message.channel.fetch_message(message.id)
+                found_buttons = [c for row in fetched_message.components for c in row.children if isinstance(c, discord.Button)]
+                if found_buttons: break
+            except discord.NotFound:
+                print(f"[Sofi Grab] ❌ Không tìm thấy tin nhắn {message.id}.")
+                return
+            except Exception as e:
+                # print(f"[Sofi Grab] ⚠️ Lỗi fetch_message: {e}")
+                pass
+            await asyncio.sleep(0.5) # Chờ 0.5s rồi thử lại
+
+        if found_buttons:
+            best_button = None
+            max_hearts = -1 # Bắt đầu từ -1 để thẻ 0 tim vẫn được xem xét
+
+            for idx, button in enumerate(found_buttons):
+                hearts = get_heart_count(button)
+                # print(f"   ➤ Nút {idx+1}: {hearts} tim")
+                
+                # Kiểm tra xem có trong ngưỡng (min <= hearts <= max)
+                if min_hearts_needed <= hearts <= max_hearts_allowed:
+                    if hearts > max_hearts:
+                        max_hearts = hearts
+                        best_button = button
+                    elif hearts == max_hearts and best_button is None: # Xử lý trường hợp nhiều thẻ = min
+                         best_button = button
+            
+            if best_button:
+                await asyncio.sleep(0.5) # Delay nhỏ trước khi click
+                await best_button.click()
+                print(f"[{bot.user.name}] → 🏆 ĐÃ CLICK nút {max_hearts} tim tại server {target_server.get('name')}!")
+            else:
+                print(f"[{bot.user.name}] → ⚠️ Không có thẻ nào đủ điều kiện ({min_hearts_needed}♡ - {max_hearts_allowed}♡).")
+        else:
+            print(f"[{bot.user.name}] → ⚠️ Không tìm thấy button nào trong tin nhắn.")
+            
+    except Exception as e:
+        print(f"[{bot.user.name}] ❌ Lỗi nghiêm trọng khi click: {e}")
+
+# --- KHỞI TẠO BOT (TÍCH HỢP) ---
+def initialize_and_run_bot(token, bot_id_str, is_main):
+    """Chạy mỗi bot trong một luồng riêng với event loop riêng"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Dùng commands.Bot để có thể click button
+    bot = commands.Bot(command_prefix="!", self_bot=True)
+
+    try:
+        bot_identifier = int(bot_id_str.split('_')[1])
+    except (IndexError, ValueError):
+        bot_identifier = 99 # Giá trị dự phòng
+    
+    @bot.event
+    async def on_ready():
+        print(f"[Bot] ✅ {'[MAIN]' if is_main else '[SUB]'} Đăng nhập: {bot.user.name} ({bot_id_str})", flush=True)
+        # Thêm bot vào manager để các luồng khác có thể truy cập
+        bot_manager.add_bot(bot_id_str, {'instance': bot, 'loop': loop, 'thread': threading.current_thread()})
+    
+    if is_main:
+        @bot.event
+        async def on_message(message, bot_num=bot_identifier):
+            # Chỉ xử lý tin nhắn từ SOFI_ID
+            if message.author.id == SOFI_ID:
+                # Kiểm tra trigger words (giống multisofi.py)
+                if ("dropping" in message.content.lower() or "thả" in message.content.lower()):
+                    # print(f"🎯 {bot.user.name} phát hiện drop! Đang soi...")
+                    # Gọi hàm xử lý grab, truyền vào bot_num để biết dùng cài đặt nào
+                    asyncio.create_task(handle_sofi_grab(bot, message, bot_num))
+            
+    try:
+        loop.run_until_complete(bot.start(token))
+    except discord.errors.LoginFailure:
+        print(f"[Bot] ❌ Login thất bại cho {bot_id_str}. Token có thể không hợp lệ.", flush=True)
+    except Exception as e:
+        print(f"[Bot] ❌ Lỗi khi chạy bot {bot_id_str}: {e}", flush=True)
+    finally:
+        # Dọn dẹp bot khỏi manager khi nó dừng
+        bot_manager.remove_bot(bot_id_str)
+        loop.close()
 
 # --- FLASK APP & GIAO DIỆN ---
 app = Flask(__name__)
 
-# Giao diện HTML đã được TÍCH HỢP
+# Giao diện HTML (ĐÃ XÓA KTB)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Integrated Panel Manager</title>
+    <title>Integrated Panel Manager (Sofi)</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&family=Orbitron:wght@400;700&display=swap" rel="stylesheet">
     <style>
@@ -119,7 +250,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <div class="header">
-            <h1 class="title">Integrated Panel Manager</h1>
+            <h1 class="title">Integrated Panel Manager (Sofi)</h1>
         </div>
         <div id="msg-status-container" class="msg-status"> <span id="msg-status-text"></span></div>
         <div class="main-grid">
@@ -138,7 +269,6 @@ HTML_TEMPLATE = """
                 <div class="server-sub-panel">
                     <h3><i class="fas fa-cogs"></i> Channel Config</h3>
                     <div class="input-group"><label>Main Channel ID</label><input type="text" class="channel-input" data-field="main_channel_id" value="{{ server.main_channel_id or '' }}"></div>
-                    <div class="input-group"><label>KTB Channel ID</label><input type="text" class="channel-input" data-field="ktb_channel_id" value="{{ server.ktb_channel_id or '' }}"></div>
                 </div>
                 
                 <div class="server-sub-panel">
@@ -182,17 +312,14 @@ HTML_TEMPLATE = """
                 const result = await response.json();
                 showStatusMessage(result.message, result.status !== 'success' ? 'error' : 'success');
                 
-                // Tự động lưu cài đặt sau khi có thay đổi thành công
                 if (result.status === 'success' && url !== '/api/save_settings') {
                     if (window.saveTimeout) clearTimeout(window.saveTimeout);
-                    // Chờ 1 chút để server xử lý rồi mới save
                     window.saveTimeout = setTimeout(() => fetch('/api/save_settings', { method: 'POST' }), 500);
                 }
                 
                 if (result.status === 'success' && result.reload) { 
                     setTimeout(() => window.location.reload(), 500); 
                 }
-                // Sau khi toggle, gọi fetchStatus để cập nhật lại text của nút
                 if (url === '/api/harvest_toggle') {
                     setTimeout(fetchStatus, 100);
                 }
@@ -223,11 +350,9 @@ HTML_TEMPLATE = """
                 if (!response.ok) return;
                 const data = await response.json();
                 
-                // Cập nhật Uptime
                 const serverUptimeSeconds = (Date.now() / 1000) - data.server_start_time;
                 updateElement(document.getElementById('uptime-timer'), { textContent: formatTime(serverUptimeSeconds) });
 
-                // PHẦN TÍCH HỢP: Cập nhật text của các nút ENABLE/DISABLE
                 data.servers.forEach(serverData => {
                     const serverPanel = document.querySelector(`.server-panel[data-server-id="${serverData.id}"]`);
                     if (!serverPanel) return;
@@ -239,10 +364,9 @@ HTML_TEMPLATE = """
                 
             } catch (error) { console.error('Error fetching status:', error); }
         }
-        setInterval(fetchStatus, 5000); // Cập nhật trạng thái mỗi 5 giây
+        setInterval(fetchStatus, 5000);
         fetchStatus();
 
-        // Lắng nghe sự kiện click
         document.querySelector('.container').addEventListener('click', e => {
             const button = e.target.closest('button');
             if (!button) return;
@@ -250,7 +374,6 @@ HTML_TEMPLATE = """
             const serverPanel = button.closest('.server-panel');
             const serverId = serverPanel ? serverPanel.dataset.serverId : null;
 
-            // Xử lý nút XÓA server
             if (button.classList.contains('btn-delete-server')) {
                 if (serverId && confirm('Bạn có chắc muốn xóa panel này?')) {
                     postData('/api/delete_server', { server_id: serverId });
@@ -258,14 +381,12 @@ HTML_TEMPLATE = """
                 return;
             }
             
-            // PHẦN TÍCH HỢP: Xử lý nút Harvest Toggle
             if (button.classList.contains('harvest-toggle')) {
                 if (serverId) {
                     const node = button.dataset.node;
                     postData('/api/harvest_toggle', { 
                         server_id: serverId, 
                         node: node, 
-                        // Lấy giá trị min/max heart khi nhấn nút
                         threshold: serverPanel.querySelector(`.harvest-threshold[data-node="${node}"]`).value, 
                         max_threshold: serverPanel.querySelector(`.harvest-max-threshold[data-node="${node}"]`).value 
                     });
@@ -274,19 +395,16 @@ HTML_TEMPLATE = """
             }
         });
         
-        // PHẦN TÍCH HỢP: Lắng nghe sự kiện THAY ĐỔI (lưu channel ID)
         document.querySelector('.main-grid').addEventListener('change', e => {
             const target = e.target;
             const serverPanel = target.closest('.server-panel');
-            // Nếu là ô input channel-input
             if (serverPanel && target.classList.contains('channel-input')) {
                 const payload = { server_id: serverPanel.dataset.serverId };
-                payload[target.dataset.field] = target.value; // data-field="main_channel_id"
+                payload[target.dataset.field] = target.value;
                 postData('/api/update_server_field', payload);
             }
         });
 
-        // Xử lý nút THÊM server
         document.getElementById('add-server-btn').addEventListener('click', () => {
             const name = prompt("Nhập tên cho panel server mới:", "Server Mới");
             if (name && name.trim()) { 
@@ -302,7 +420,6 @@ HTML_TEMPLATE = """
 @app.route("/")
 def index():
     """Hiển thị trang chủ với các panel đã lưu"""
-    # PHẦN TÍCH HỢP: Cần tạo main_bots_info để template có thể lặp qua
     main_bots_count = len([t for t in main_tokens if t.strip()])
     main_bots_info = []
     for i in range(main_bots_count):
@@ -311,22 +428,18 @@ def index():
         
     return render_template_string(HTML_TEMPLATE, 
         servers=sorted(servers, key=lambda s: s.get('name', '')),
-        main_bots_info=main_bots_info # Truyền thông tin bot cho template
+        main_bots_info=main_bots_info
     )
 
 @app.route("/api/add_server", methods=['POST'])
 def api_add_server():
-    """API để thêm một panel server mới"""
     name = request.json.get('name')
     if not name: 
         return jsonify({'status': 'error', 'message': 'Tên server là bắt buộc.'}), 400
     
-    new_server = {
-        "id": f"server_{uuid.uuid4().hex}", 
-        "name": name
-    }
+    new_server = {"id": f"server_{uuid.uuid4().hex}", "name": name}
     
-    # PHẦN TÍCH HỢP: Thêm các key mặc định cho nhặt thẻ vào server mới
+    # Thêm các key mặc định cho nhặt thẻ (ĐÃ XÓA KTB)
     main_bots_count = len([t for t in main_tokens if t.strip()])
     for i in range(main_bots_count):
         bot_num = i + 1
@@ -335,63 +448,47 @@ def api_add_server():
         new_server[f'max_heart_threshold_{bot_num}'] = 99999
         
     servers.append(new_server)
-    save_settings() # Lưu ngay lập tức
-    
+    save_settings()
     return jsonify({'status': 'success', 'message': f'✅ Panel "{name}" đã được thêm.', 'reload': True})
 
 @app.route("/api/delete_server", methods=['POST'])
 def api_delete_server():
-    """API để xóa một panel server"""
     server_id = request.json.get('server_id')
     servers_count_before = len(servers)
     servers[:] = [s for s in servers if s.get('id') != server_id]
     servers_count_after = len(servers)
-
     if servers_count_before == servers_count_after:
         return jsonify({'status': 'error', 'message': 'Không tìm thấy panel để xóa.'})
-
     save_settings()
     return jsonify({'status': 'success', 'message': f'🗑️ Panel đã được xóa.', 'reload': True})
 
-# --- CÁC API MỚI ĐƯỢC TÍCH HỢP ---
-
 def find_server(server_id): 
-    """Hàm trợ giúp tìm server theo ID"""
     return next((s for s in servers if s.get('id') == server_id), None)
 
 @app.route("/api/update_server_field", methods=['POST'])
 def api_update_server_field():
-    """API để cập nhật các trường input (như channel ID)"""
     data = request.json
     server = find_server(data.get('server_id'))
     if not server: 
         return jsonify({'status': 'error', 'message': 'Không tìm thấy server.'}), 404
-    
     key_updated = ""
     for key, value in data.items():
         if key != 'server_id':
-            server[key] = value
+            server[key] = value.strip() # Thêm .strip() để xóa khoảng trắng
             key_updated = key
-            
-    return jsonify({'status': 'success', 'message': f'🔧 Đã cập nhật {key_updated} cho {server.get("name")}.'})
+    return jsonify({'status': 'success', 'message': f'🔧 Đã cập nhật {key_updated}.'})
 
 @app.route("/api/harvest_toggle", methods=['POST'])
 def api_harvest_toggle():
-    """API để bật/tắt nhặt thẻ và lưu threshold"""
     data = request.json
     server, node_str = find_server(data.get('server_id')), data.get('node')
     if not server or not node_str: 
         return jsonify({'status': 'error', 'message': 'Yêu cầu không hợp lệ.'}), 400
     
-    node = str(node_str) # node là "1", "2", ...
-    grab_key = f'auto_grab_enabled_{node}'
-    threshold_key = f'heart_threshold_{node}'
-    max_threshold_key = f'max_heart_threshold_{node}'
+    node = str(node_str)
+    grab_key, threshold_key, max_threshold_key = f'auto_grab_enabled_{node}', f'heart_threshold_{node}', f'max_heart_threshold_{node}'
     
-    # Bật/Tắt
     server[grab_key] = not server.get(grab_key, False)
-    
-    # Cập nhật threshold
     try:
         server[threshold_key] = int(data.get('threshold', 50))
         server[max_threshold_key] = int(data.get('max_threshold', 99999))
@@ -405,23 +502,42 @@ def api_harvest_toggle():
 
 @app.route("/api/save_settings", methods=['POST'])
 def api_save_settings(): 
-    """API để JS gọi lưu cài đặt"""
     save_settings()
     return jsonify({'status': 'success', 'message': '💾 Đã lưu cài đặt.'})
 
 @app.route("/status")
 def status_endpoint():
-    """API cung cấp Uptime và danh sách server cho JS"""
     return jsonify({
         'server_start_time': server_start_time,
-        'servers': servers # PHẦN TÍCH HỢP: Trả về servers để JS cập nhật UI
+        'servers': servers
     })
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    print("🚀 Integrated Panel Manager - Đang khởi động...", flush=True)
-    load_settings() # Tải các panel đã lưu từ JSONBin
+    print("🚀 Integrated Sofi Panel Manager - Đang khởi động...", flush=True)
+    load_settings()
 
+    print("🔌 Khởi tạo các bot chính (main bots)...", flush=True)
+    bot_threads = []
+    
+    # Lọc các token hợp lệ
+    valid_main_tokens = [t.strip() for t in main_tokens if t.strip()]
+    
+    for i, token in enumerate(valid_main_tokens):
+        bot_num = i + 1
+        bot_id = f"main_{bot_num}"
+        # Khởi chạy mỗi bot trong một luồng riêng
+        thread = threading.Thread(target=initialize_and_run_bot, args=(token, bot_id, True), daemon=True)
+        bot_threads.append(thread)
+        thread.start()
+        
+        # Thêm độ trễ giữa các lần khởi động bot để tránh bị rate limit
+        delay = random.uniform(3, 5) 
+        print(f"[Bot Init] ⏳ Chờ {delay:.2f}s trước khi khởi động bot tiếp theo...", flush=True)
+        time.sleep(delay)
+
+    print(f"✅ Đã khởi động {len(bot_threads)} bot chính.")
+    
     port = int(os.environ.get("PORT", 10000))
     print(f"🌐 Máy chủ web đang chạy tại http://0.0.0.0:{port}", flush=True)
     serve(app, host="0.0.0.0", port=port)
