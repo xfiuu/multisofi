@@ -226,9 +226,9 @@ async def click_and_message(message, delay, bot, account_info, is_main_acc):
             if best_button:
                 await asyncio.sleep(0.5)
                 await best_button.click()
-                print(f"[{account_info['channel_id']}] → 🏆 ĐÃ CLICK nút {max_hearts} tim!")
+                print(f"[{current_channel_id}] → 🏆 ĐÃ CLICK nút {max_hearts} tim!")
             else:
-                print(f"[{account_info['channel_id']}] → ⚠️ Không có thẻ nào đủ {min_hearts_needed} tim để nhặt (theo cấu hình {config_name}).")
+                print(f"[{current_channel_id}] → ⚠️ Không có thẻ nào đủ {min_hearts_needed} tim để nhặt (theo cấu hình {config_name}).")
             print("------------------------------------------------")
 
     except Exception as e:
@@ -284,7 +284,7 @@ async def drop_loop():
                 print(f"⚠️ {bot.user.name} không tìm thấy kênh {ch_id} để gửi 'sd'")
                 
             i += 1
-            await asyncio.sleep(485) # Thời gian nghỉ giữa các lần drop
+            await asyncio.sleep(247) # Thời gian nghỉ giữa các lần drop
         except Exception as e:
             print(f"Lỗi trong drop_loop: {e}")
             await asyncio.sleep(60)
