@@ -1,5 +1,5 @@
 # PHIÊN BẢN TÍCH HỢP: Panel + Logic Bot Nhặt Thẻ SOFI (Button-based)
-import os, requests, json, uuid, time, re
+import os, requests, json, uuid, time, re, random # <--- ĐÃ SỬA LỖI Ở ĐÂY
 import discord
 from discord.ext import commands
 import asyncio
