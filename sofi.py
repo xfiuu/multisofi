@@ -9,8 +9,10 @@ from flask import Flask, request, render_template_string
 # --- CẤU HÌNH WEB SERVER & HTML ---
 app = Flask(__name__)
 
-# Biến toàn cục lưu trữ cấu hình số tim tối thiểu
-MIN_HEARTS_CONFIG = {"value": 1} # Mặc định nhặt từ 1 tim trở lên
+# Biến toàn cục lưu trữ cấu hình số tim
+DEFAULT_MIN_HEARTS = {"value": 1} # Mặc định nhặt từ 1 tim trở lên
+CHANNEL_CONFIGS = {} # Cấu hình riêng cho từng kênh: {"channel_id": {"name": "Tên Server", "hearts": 5}}
+
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -18,42 +20,139 @@ HTML_TEMPLATE = """
 <head>
     <title>Sofi Bot Config</title>
     <style>
-        body { font-family: sans-serif; background-color: #2c2f33; color: #fff; text-align: center; padding: 50px; }
-        h1 { color: #7289da; }
-        input[type="number"] { padding: 10px; font-size: 20px; width: 100px; text-align: center; border-radius: 5px; border: none; }
-        button { padding: 10px 20px; font-size: 20px; background-color: #7289da; color: white; border: none; border-radius: 5px; cursor: pointer; margin-top: 20px; }
+        body { font-family: sans-serif; background-color: #2c2f33; color: #fff; text-align: center; padding: 20px 50px; }
+        .container { max-width: 800px; margin: 0 auto; text-align: left; }
+        h1 { color: #7289da; text-align: center; }
+        h2 { color: #7289da; border-bottom: 2px solid #7289da; padding-bottom: 5px; margin-top: 40px; }
+        input[type="number"], input[type="text"] { padding: 10px; font-size: 16px; width: 100%; box-sizing: border-box; border-radius: 5px; border: none; margin-bottom: 10px; background-color: #40444b; color: #fff; }
+        input[type="number"] { width: 120px; text-align: center; }
+        button { padding: 10px 20px; font-size: 16px; background-color: #7289da; color: white; border: none; border-radius: 5px; cursor: pointer; margin-top: 10px; }
         button:hover { background-color: #5b6eae; }
-        .status { margin-top: 30px; font-size: 18px; color: #43b581; }
+        button.delete { background-color: #f04747; }
+        button.delete:hover { background-color: #c03939; }
+        .status { text-align: center; margin: 20px 0; font-size: 18px; color: #43b581; font-weight: bold; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #40444b; padding: 12px; text-align: left; }
+        th { background-color: #36393f; }
+        form { background-color: #36393f; padding: 20px; border-radius: 8px; }
+        label { display: block; margin: 10px 0 5px; font-weight: bold; }
     </style>
 </head>
 <body>
-    <h1>Cấu Hình Bot Sofi</h1>
-    <p>Nhập số tim tối thiểu để bot bắt đầu nhặt:</p>
-    <form method="POST" action="/">
-        <input type="number" name="min_hearts" min="0" value="{{ current_value }}" required>
-        <br>
-        <button type="submit">Lưu Cài Đặt</button>
-    </form>
-    {% if saved_value %}
-    <div class="status">✅ Đã lưu! Bot chỉ nhặt thẻ có từ <b>{{ saved_value }}</b> tim trở lên.</div>
-    {% endif %}
-    <p>Giá trị hiện tại: <b>{{ current_value }}</b></p>
+    <div class="container">
+        <h1>Bảng Điều Khiển Bot Sofi</h1>
+
+        {% if status_message %}
+        <div class="status">{{ status_message }}</div>
+        {% endif %}
+
+        <h2>Cấu Hình Mặc Định</h2>
+        <form method="POST" action="/">
+            <input type="hidden" name="action" value="set_default">
+            <label for="default_hearts">Số tim mặc định (cho các kênh không có panel):</label>
+            <input type="number" name="default_hearts" min="0" value="{{ default_value }}" required>
+            <br>
+            <button type="submit">Lưu Mặc Định</button>
+            <p style="font-size: 14px; color: #999;">Giá trị hiện tại: <b>{{ default_value }}</b> tim</p>
+        </form>
+        
+        <h2>Các Panel Đã Cấu Hình</h2>
+        {% if configs %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Tên Server</th>
+                    <th>ID Kênh</th>
+                    <th>Nhặt từ (tim)</th>
+                    <th>Hành động</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for channel_id, config in configs.items() %}
+                <tr>
+                    <td>{{ config.name }}</td>
+                    <td>{{ channel_id }}</td>
+                    <td><b>{{ config.hearts }}</b></td>
+                    <td>
+                        <form method="POST" action="/" style="padding: 0; background: none;">
+                            <input type="hidden" name="action" value="delete_config">
+                            <input type="hidden" name="channel_id" value="{{ channel_id }}">
+                            <button type="submit" class="delete">Xóa</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p>Chưa có panel nào được cấu hình. Sử dụng biểu mẫu bên dưới để thêm.</p>
+        {% endif %}
+
+        <h2>Thêm / Cập Nhật Panel</h2>
+        <form method="POST" action="/">
+            <input type="hidden" name="action" value="add_config">
+            
+            <label for="server_name">Tên Server (Để bạn dễ nhớ):</label>
+            <input type="text" name="server_name" placeholder="Ví dụ: Server A, Kênh farm B..." required>
+
+            <label for="channel_id">ID Kênh (Channel ID):</label>
+            <input type="text" name="channel_id" placeholder="Nhập ID của kênh cần nhặt thẻ" required>
+            
+            <label for="min_hearts">Số tim tối thiểu để nhặt:</label>
+            <input type="number" name="min_hearts" min="0" value="1" required>
+            
+            <br>
+            <button type="submit">Lưu Panel</button>
+        </form>
+
+    </div>
 </body>
 </html>
 """
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    saved_value = None
+    status_message = None
     if request.method == "POST":
+        action = request.form.get("action")
+        
         try:
-            new_val = int(request.form.get("min_hearts"))
-            MIN_HEARTS_CONFIG["value"] = new_val
-            saved_value = new_val
-            print(f"🌐 [WEB] Đã cập nhật MIN_HEARTS lên: {new_val}")
+            if action == "set_default":
+                new_val = int(request.form.get("default_hearts"))
+                DEFAULT_MIN_HEARTS["value"] = new_val
+                status_message = f"✅ Đã lưu! Mặc định nhặt từ {new_val} tim."
+                print(f"🌐 [WEB] Đã cập nhật DEFAULT_HEARTS lên: {new_val}")
+            
+            elif action == "add_config":
+                server_name = request.form.get("server_name", "Không Tên")
+                channel_id = request.form.get("channel_id")
+                min_hearts = int(request.form.get("min_hearts"))
+                
+                if not channel_id or not channel_id.isdigit():
+                     status_message = "❌ Lỗi: ID Kênh phải là số và không được để trống."
+                else:
+                    CHANNEL_CONFIGS[channel_id] = {"name": server_name, "hearts": min_hearts}
+                    status_message = f"✅ Đã lưu Panel cho '{server_name}' (ID: {channel_id}) với {min_hearts} tim."
+                    print(f"🌐 [WEB] Đã thêm/cập nhật Panel: {channel_id} - {server_name} - {min_hearts} tim")
+            
+            elif action == "delete_config":
+                channel_id_to_delete = request.form.get("channel_id")
+                if channel_id_to_delete in CHANNEL_CONFIGS:
+                    deleted_name = CHANNEL_CONFIGS.pop(channel_id_to_delete)["name"]
+                    status_message = f"✅ Đã xóa Panel '{deleted_name}' (ID: {channel_id_to_delete})."
+                    print(f"🌐 [WEB] Đã xóa Panel: {channel_id_to_delete}")
+                
         except (ValueError, TypeError):
-            pass
-    return render_template_string(HTML_TEMPLATE, current_value=MIN_HEARTS_CONFIG["value"], saved_value=saved_value)
+            status_message = "❌ Lỗi: Vui lòng nhập số hợp lệ cho ID Kênh và Số Tim."
+        except Exception as e:
+            status_message = f"❌ Lỗi máy chủ: {e}"
+
+    return render_template_string(
+        HTML_TEMPLATE, 
+        default_value=DEFAULT_MIN_HEARTS["value"], 
+        configs=CHANNEL_CONFIGS, 
+        status_message=status_message
+    )
 
 def run_flask():
     # Chạy Flask trên port 10000 (thường dùng cho Render) hoặc port được chỉ định
@@ -99,11 +198,22 @@ async def click_and_message(message, delay, bot, account_info, is_main_acc):
             await asyncio.sleep(1)
 
         if found_buttons:
-            min_hearts_needed = MIN_HEARTS_CONFIG["value"]
+            # === LOGIC NÂNG CẤP: LẤY CẤU HÌNH THEO KÊNH ===
+            current_channel_id = str(message.channel.id)
+            config = CHANNEL_CONFIGS.get(current_channel_id)
+            
+            if config:
+                min_hearts_needed = config["hearts"]
+                config_name = f"'{config['name']}'"
+            else:
+                min_hearts_needed = DEFAULT_MIN_HEARTS["value"]
+                config_name = "Mặc Định"
+            # ============================================
+
             best_button = None
             max_hearts = -1
 
-            print(f"--- 📊 Phân tích thẻ (Yêu cầu: >={min_hearts_needed} tim) ---")
+            print(f"--- 📊 Phân tích thẻ (Kênh: {current_channel_id}, Cấu hình: {config_name}, Yêu cầu: >={min_hearts_needed} tim) ---")
             for idx, button in enumerate(found_buttons):
                 hearts = get_heart_count(button)
                 print(f"   ➤ Nút {idx+1}: {hearts} tim")
@@ -118,7 +228,7 @@ async def click_and_message(message, delay, bot, account_info, is_main_acc):
                 await best_button.click()
                 print(f"[{account_info['channel_id']}] → 🏆 ĐÃ CLICK nút {max_hearts} tim!")
             else:
-                print(f"[{account_info['channel_id']}] → ⚠️ Không có thẻ nào đủ {min_hearts_needed} tim để nhặt.")
+                print(f"[{account_info['channel_id']}] → ⚠️ Không có thẻ nào đủ {min_hearts_needed} tim để nhặt (theo cấu hình {config_name}).")
             print("------------------------------------------------")
 
     except Exception as e:
@@ -136,9 +246,14 @@ async def run_account(account, idx, startup_delay):
 
     @bot.event
     async def on_message(message):
-        if message.author.id == SOFI_ID and str(message.channel.id) == account["channel_id"]:
+        # *** LƯU Ý: Phần `account["channel_id"]` trong `accounts` giờ chỉ dùng để auto-drop "sd"
+        # Logic nhặt thẻ (click_and_message) sẽ tự động áp dụng cho BẤT KỲ KÊNH NÀO
+        # mà bot chính (is_main) nhìn thấy tin nhắn của Sofi.
+        
+        if message.author.id == SOFI_ID: # Bot sẽ phản ứng ở mọi kênh nó thấy
             if is_main and ("dropping" in message.content.lower() or "thả" in message.content.lower()):
-                print(f"🎯 {bot.user.name} phát hiện drop! Đang soi...")
+                print(f"🎯 {bot.user.name} phát hiện drop trong kênh {message.channel.id}! Đang soi...")
+                # Logic mới sẽ tự kiểm tra xem kênh này có panel không
                 asyncio.create_task(click_and_message(message, MAIN_ACC_GRAB_DELAY, bot, account, True))
 
     try: await bot.start(account["token"])
@@ -150,15 +265,29 @@ async def drop_loop():
     i = 0
     while True:
         try:
+            # Vẫn loop qua các channel_id trong cấu hình `accounts` để gửi 'sd'
             bot = running_bots[i % len(running_bots)]
             acc = accounts[i % len(accounts)]
-            ch = bot.get_channel(int(acc["channel_id"]))
+            ch_id = acc.get("channel_id")
+            
+            if not ch_id:
+                print(f"⚠️ Bỏ qua drop cho {bot.user.name} vì không có CHANNEL_ID trong cấu hình.")
+                i += 1
+                await asyncio.sleep(60) # Chờ 1 phút rồi thử acc tiếp
+                continue
+                
+            ch = bot.get_channel(int(ch_id))
             if ch:
                 await ch.send("sd")
-                print(f"💬 {bot.user.name} gửi 'sd'")
+                print(f"💬 {bot.user.name} gửi 'sd' đến kênh {ch_id}")
+            else:
+                print(f"⚠️ {bot.user.name} không tìm thấy kênh {ch_id} để gửi 'sd'")
+                
             i += 1
-            await asyncio.sleep(247)
-        except: await asyncio.sleep(60)
+            await asyncio.sleep(485) # Thời gian nghỉ giữa các lần drop
+        except Exception as e:
+            print(f"Lỗi trong drop_loop: {e}")
+            await asyncio.sleep(60)
 
 async def main():
     keep_alive() # Khởi động web server
